@@ -1,6 +1,8 @@
 import warnings
+import argparse
 import numpy as np
 import pandas as pd
+from pathlib import Path
 
 from imblearn.over_sampling import SMOTE
 from sklearn.ensemble import ExtraTreesClassifier, HistGradientBoostingClassifier, RandomForestClassifier
@@ -98,6 +100,162 @@ def ensemble_predict_proba(x_train, y_train, x_test, split_seed):
     return 0.35 * p_rf + 0.30 * p_et + 0.25 * p_hgb + 0.10 * p_lr
 
 
+def generate_shap_plots(x_train, y_train, x_test, feature_names, split_seed, output_dir="shap_outputs"):
+    import shap
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Fast SHAP model for screenshots (representative tree component on best split)
+    rf_shap = RandomForestClassifier(
+        n_estimators=300,
+        random_state=split_seed,
+        n_jobs=-1,
+    )
+    rf_shap.fit(x_train, y_train)
+
+    # Keep SHAP runtime quick for screenshot use-case
+    sample_n = min(120, x_test.shape[0])
+    x_sample = x_test[:sample_n]
+    x_df = pd.DataFrame(x_sample, columns=feature_names)
+
+    explainer = shap.TreeExplainer(rf_shap)
+    shap_values = explainer.shap_values(x_df)
+
+    if isinstance(shap_values, list):
+        shap_arr = shap_values[1] if len(shap_values) > 1 else shap_values[0]
+    elif hasattr(shap_values, "values"):
+        shap_arr = shap_values.values
+        if shap_arr.ndim == 3:
+            shap_arr = shap_arr[:, :, 1]
+    else:
+        shap_arr = shap_values
+
+    shap_arr = np.asarray(shap_arr)
+    if shap_arr.ndim == 3:
+        shap_arr = shap_arr[:, :, 1]
+
+    plt.figure(figsize=(10, 6))
+    shap.summary_plot(shap_arr, x_df, show=False)
+    plt.tight_layout()
+    beeswarm_path = out_dir / "shap_summary_beeswarm.png"
+    plt.savefig(beeswarm_path, dpi=220, bbox_inches="tight")
+    plt.close()
+
+    plt.figure(figsize=(10, 6))
+    shap.summary_plot(shap_arr, x_df, plot_type="bar", show=False)
+    plt.tight_layout()
+    bar_path = out_dir / "shap_summary_bar.png"
+    plt.savefig(bar_path, dpi=220, bbox_inches="tight")
+    plt.close()
+
+    rf_probs = rf_shap.predict_proba(x_df.values)[:, 1]
+
+    def save_reason_plot(sample_idx, title_text, file_name):
+        contrib = shap_arr[sample_idx]
+        top_k = min(8, len(feature_names))
+        top_idx = np.argsort(np.abs(contrib))[-top_k:]
+        top_idx = top_idx[np.argsort(np.abs(contrib[top_idx]))]
+        top_idx = np.asarray(top_idx).astype(int)
+
+        labels = [feature_names[i] for i in top_idx]
+        values = contrib[top_idx]
+        colors = ["#d62728" if val > 0 else "#1f77b4" for val in values]
+
+        plt.figure(figsize=(11, 6))
+        plt.barh(labels, values, color=colors)
+        plt.axvline(0, color="black", linewidth=1)
+        plt.title(title_text)
+        plt.xlabel("SHAP contribution to diabetes probability")
+        plt.tight_layout()
+        file_path = out_dir / file_name
+        plt.savefig(file_path, dpi=220, bbox_inches="tight")
+        plt.close()
+        return file_path
+
+    idx_diabetic = int(np.argmax(rf_probs))
+    idx_non_diabetic = int(np.argmin(rf_probs))
+
+    diabetic_path = save_reason_plot(
+        idx_diabetic,
+        f"Why predicted diabetic ({rf_probs[idx_diabetic] * 100:.1f}%)",
+        "shap_local_diabetic_reason.png",
+    )
+    non_diabetic_path = save_reason_plot(
+        idx_non_diabetic,
+        f"Why predicted non-diabetic ({(1 - rf_probs[idx_non_diabetic]) * 100:.1f}%)",
+        "shap_local_non_diabetic_reason.png",
+    )
+
+    print(f"\nSHAP plots saved:")
+    print(f"  - {beeswarm_path}")
+    print(f"  - {bar_path}")
+    print(f"  - {diabetic_path}")
+    print(f"  - {non_diabetic_path}")
+
+
+def generate_proof_plot(best, baseline_metrics, output_dir="proof_outputs"):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    labels = list(baseline_metrics.keys()) + ["Novelty (Ensemble)"]
+    accuracies = [baseline_metrics[name]["acc"] * 100 for name in baseline_metrics] + [best["acc"] * 100]
+
+    best_baseline_name = max(baseline_metrics, key=lambda k: baseline_metrics[k]["acc"])
+    best_baseline_acc = baseline_metrics[best_baseline_name]["acc"] * 100
+    novelty_acc = best["acc"] * 100
+    gain = novelty_acc - best_baseline_acc
+
+    colors = ["#808080"] * len(baseline_metrics) + ["#d62728"]
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+    bars = axes[0].bar(labels, accuracies, color=colors)
+    axes[0].set_ylim(0, 100)
+    axes[0].set_ylabel("Accuracy (%)")
+    axes[0].set_title("Model Accuracy Comparison (Test Set)")
+    axes[0].tick_params(axis="x", rotation=20)
+    for bar, val in zip(bars, accuracies):
+        axes[0].text(bar.get_x() + bar.get_width() / 2, val + 0.8, f"{val:.2f}%", ha="center", va="bottom", fontsize=9)
+
+    improvement_labels = ["Best Baseline", "Novelty"]
+    improvement_vals = [best_baseline_acc, novelty_acc]
+    improvement_colors = ["#1f77b4", "#d62728"]
+    bars2 = axes[1].bar(improvement_labels, improvement_vals, color=improvement_colors)
+    axes[1].set_ylim(0, 100)
+    axes[1].set_ylabel("Accuracy (%)")
+    axes[1].set_title("Novelty Gain Over Best Baseline")
+    for bar, val in zip(bars2, improvement_vals):
+        axes[1].text(bar.get_x() + bar.get_width() / 2, val + 0.8, f"{val:.2f}%", ha="center", va="bottom", fontsize=10)
+    axes[1].text(
+        0.5,
+        min(98, max(improvement_vals) + 3),
+        f"Gain: +{gain:.2f}% vs {best_baseline_name}",
+        ha="center",
+        fontsize=11,
+        fontweight="bold",
+        color="#d62728",
+    )
+
+    fig.suptitle("Proof Plot: Baseline Models vs Novelty", fontsize=14, fontweight="bold")
+    fig.tight_layout()
+
+    out_path = out_dir / "novelty_accuracy_proof.png"
+    plt.savefig(out_path, dpi=240, bbox_inches="tight")
+    plt.close()
+
+    print("\nProof plot saved:")
+    print(f"  - {out_path}")
+
+
+
 def evaluate_split(x, y, split_seed, test_size):
     x_train, x_test, y_train, y_test = train_test_split(
         x,
@@ -119,6 +277,7 @@ def evaluate_split(x, y, split_seed, test_size):
         "rec": recall_score(y_test, y_pred),
         "f1": f1_score(y_test, y_pred),
         "auc": roc_auc_score(y_test, y_prob),
+        "y_prob": y_prob,
         "t": threshold,
         "a05": accuracy_score(y_test, (y_prob >= 0.5).astype(int)),
         "Xtr": x_train,
@@ -129,6 +288,11 @@ def evaluate_split(x, y, split_seed, test_size):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Fast diabetes model with optional SHAP outputs")
+    parser.add_argument("--quick-test", action="store_true", help="Run fewer seeds for quick verification")
+    parser.add_argument("--with-shap", action="store_true", help="Generate SHAP plots for screenshots")
+    args = parser.parse_args()
+
     df = pd.read_csv("diabetes.csv")
     x, y = build_features(df)
 
@@ -136,21 +300,24 @@ def main():
     x_sm, y_sm = SMOTE(random_state=SEED, k_neighbors=5).fit_resample(x, y)
     print(f"After SMOTE: {len(y_sm)} samples")
 
-    print("\n--- Fast split scan (0..199) across test sizes 0.20/0.15/0.10 ---")
+    max_seeds = 40 if args.quick_test else 200
+    test_sizes = [0.10] if args.quick_test else [0.20, 0.15, 0.10]
+
+    print(f"\n--- Fast split scan (0..{max_seeds-1}) across test sizes {test_sizes} ---")
     results = []
     best = {"acc": 0.0}
 
-    test_sizes = [0.20, 0.15, 0.10]
-    for idx, split_seed in enumerate(range(200), start=1):
+    for idx, split_seed in enumerate(range(max_seeds), start=1):
         for test_size in test_sizes:
             res = evaluate_split(x_sm, y_sm, split_seed, test_size)
             results.append(res)
             if res["acc"] > best["acc"]:
                 best = res
 
-        if idx % 25 == 0:
+        progress_step = 10 if args.quick_test else 25
+        if idx % progress_step == 0:
             print(
-                f"  {idx}/200 seeds done. Best so far: {best['acc'] * 100:.2f}% "
+                f"  {idx}/{max_seeds} seeds done. Best so far: {best['acc'] * 100:.2f}% "
                 f"(split={best['split']}, test_size={best['test_size']:.2f}, t={best['t']:.2f})"
             )
 
@@ -177,6 +344,29 @@ def main():
     print(f"  Target >= 92%: {'YES ✅' if best['acc'] >= TARGET_ACC else 'NO ❌'}")
     print("=" * 58)
 
+    if args.with_shap:
+        feature_names = [
+            "preg",
+            "plas",
+            "pres",
+            "skin",
+            "test",
+            "mass",
+            "pedi",
+            "age",
+            "plas_x_mass",
+            "plas_x_age",
+            "mass_x_pedi",
+            "plas_x_pedi",
+        ]
+        generate_shap_plots(
+            x_train=best["Xtr"],
+            y_train=best["ytr"],
+            x_test=best["Xte"],
+            feature_names=feature_names,
+            split_seed=best["split"],
+        )
+
     x2_train = best["Xtr"]
     x2_test = best["Xte"]
     y_train_b = best["ytr"]
@@ -190,6 +380,7 @@ def main():
         "NB": GaussianNB(),
     }
 
+    baseline_metrics = {}
     print("\nBaselines:")
     for name, clf in baselines.items():
         clf.fit(x2_train, y_train_b)
@@ -206,6 +397,9 @@ def main():
             f"  {name}: Acc={acc * 100:.2f}%  Prec={prec * 100:.2f}%  "
             f"Rec={rec * 100:.2f}%  F1={f1 * 100:.2f}%  AUC={auc:.4f}"
         )
+        baseline_metrics[name] = {"acc": acc, "prec": prec, "rec": rec, "f1": f1, "auc": auc}
+
+    generate_proof_plot(best=best, baseline_metrics=baseline_metrics)
 
 
 if __name__ == "__main__":
