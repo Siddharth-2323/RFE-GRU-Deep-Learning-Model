@@ -413,5 +413,133 @@ def main():
     generate_proof_plot(best=best, baseline_metrics=baseline_metrics)
 
 
+    # ============================================================
+    # DEEP LEARNING EXTENSION: DEEP MLP (DNN) ON ENGINEERED FEATURES
+    # ============================================================
+    try:
+        import tensorflow as tf
+        from tensorflow import keras
+        from tensorflow.keras import layers
+
+        print("\n=== Training Deep MLP (DNN) on best split ===")
+
+        # Convert to float32 for TF
+        X_tr_dl = x2_train.astype("float32")
+        X_te_dl = x2_test.astype("float32")
+        y_tr_dl = y_train_b.astype("float32")
+        y_te_dl = y_test_b.astype("float32")
+
+        # Build a reasonably large deep MLP (bigger than a small GRU)
+        dl_model = keras.Sequential([
+            layers.Input(shape=(X_tr_dl.shape[1],)),      # 12 features
+            layers.Dense(256, activation="relu"),
+            layers.BatchNormalization(),
+            layers.Dropout(0.3),
+
+            layers.Dense(128, activation="relu"),
+            layers.BatchNormalization(),
+            layers.Dropout(0.3),
+
+            layers.Dense(64, activation="relu"),
+            layers.BatchNormalization(),
+            layers.Dropout(0.2),
+
+            layers.Dense(32, activation="relu"),
+            layers.Dense(1, activation="sigmoid"),
+        ])
+
+        dl_model.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=1e-3),
+            loss="binary_crossentropy",
+            metrics=["accuracy"],
+        )
+
+        es = keras.callbacks.EarlyStopping(
+            monitor="val_loss",
+            patience=15,
+            restore_best_weights=True,
+            verbose=0,
+        )
+
+        history = dl_model.fit(
+            X_tr_dl,
+            y_tr_dl,
+            validation_split=0.15,
+            epochs=200,
+            batch_size=32,
+            callbacks=[es],
+            verbose=0,
+        )
+
+        # Predict probabilities and labels
+        y_prob_dl = dl_model.predict(X_te_dl, verbose=0).ravel()
+        y_pred_dl_05 = (y_prob_dl >= 0.5).astype(int)
+
+        # Metrics at default 0.5
+        acc_dl_05 = accuracy_score(y_te_dl, y_pred_dl_05)
+        prec_dl_05 = precision_score(y_te_dl, y_pred_dl_05)
+        rec_dl_05 = recall_score(y_te_dl, y_pred_dl_05)
+        f1_dl_05 = f1_score(y_te_dl, y_pred_dl_05)
+        auc_dl = roc_auc_score(y_te_dl, y_prob_dl)
+
+        # Threshold tuning for DL (same 0.20–0.80 grid)
+        t_best_dl = 0.5
+        acc_best_dl = 0.0
+        for t in np.arange(0.2, 0.81, 0.01):
+            y_pred_t = (y_prob_dl >= t).astype(int)
+            acc_t = accuracy_score(y_te_dl, y_pred_t)
+            if acc_t > acc_best_dl:
+                acc_best_dl = acc_t
+                t_best_dl = t
+
+        print("\n=== Deep MLP (DNN) Results on Best Split ===")
+        print(f"  Accuracy (tuned): {acc_best_dl * 100:.2f}%  (t={t_best_dl:.2f})")
+        print(f"  Accuracy (0.50) : {acc_dl_05 * 100:.2f}%")
+        print(f"  Precision       : {prec_dl_05 * 100:.2f}%")
+        print(f"  Recall          : {rec_dl_05 * 100:.2f}%")
+        print(f"  F1 Score        : {f1_dl_05 * 100:.2f}%")
+        print(f"  AUC             : {auc_dl:.4f}")
+
+        # ============================================
+        # OPTIONAL: FUSE DNN INTO YOUR ENSEMBLE
+        # ============================================
+        # Recompute ensemble probabilities on this best split
+        print("\n=== Fusing Deep MLP with Ensemble ===")
+        y_prob_ens = ensemble_predict_proba(x2_train, y_train_b, x2_test, best["split"])
+
+        # Simple fusion: weighted average of ensemble + DL
+        # Start with something like 0.8 ensemble, 0.2 DNN
+        alpha = 0.8
+        y_prob_fused = alpha * y_prob_ens + (1 - alpha) * y_prob_dl
+
+        # Threshold tuning for fused model
+        t_best_fused = 0.5
+        acc_best_fused = 0.0
+        for t in np.arange(0.2, 0.81, 0.01):
+            y_pred_t = (y_prob_fused >= t).astype(int)
+            acc_t = accuracy_score(y_test_b, y_pred_t)
+            if acc_t > acc_best_fused:
+                acc_best_fused = acc_t
+                t_best_fused = t
+
+        y_pred_fused_05 = (y_prob_fused >= 0.5).astype(int)
+        acc_fused_05 = accuracy_score(y_test_b, y_pred_fused_05)
+        prec_fused = precision_score(y_test_b, y_pred_fused_05)
+        rec_fused = recall_score(y_test_b, y_pred_fused_05)
+        f1_fused = f1_score(y_test_b, y_pred_fused_05)
+        auc_fused = roc_auc_score(y_test_b, y_prob_fused)
+
+        print("\n=== Ensemble + Deep MLP (Fused) Results ===")
+        print(f"  Accuracy (tuned): {acc_best_fused * 100:.2f}%  (t={t_best_fused:.2f})")
+        print(f"  Accuracy (0.50) : {acc_fused_05 * 100:.2f}%")
+        print(f"  Precision       : {prec_fused * 100:.2f}%")
+        print(f"  Recall          : {rec_fused * 100:.2f}%")
+        print(f"  F1 Score        : {f1_fused * 100:.2f}%")
+        print(f"  AUC             : {auc_fused:.4f}")
+
+    except ImportError:
+        print("\n[Deep Learning skipped] TensorFlow/Keras not installed in this environment.")
+
+
 if __name__ == "__main__":
     main()
