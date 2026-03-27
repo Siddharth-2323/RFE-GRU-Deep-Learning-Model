@@ -3,6 +3,7 @@ import argparse
 import numpy as np
 import pandas as pd
 from pathlib import Path
+from itertools import combinations
 
 from imblearn.over_sampling import SMOTE
 from sklearn.ensemble import ExtraTreesClassifier, HistGradientBoostingClassifier, RandomForestClassifier
@@ -23,8 +24,26 @@ TARGET_ACC = 0.92
 def build_features(df: pd.DataFrame):
     feature_cols = ["preg", "plas", "pres", "skin", "test", "mass", "pedi", "age"]
     zero_cols = ["plas", "pres", "skin", "test", "mass"]
+    full_to_short = {
+        "Pregnancies": "preg",
+        "Glucose": "plas",
+        "BloodPressure": "pres",
+        "SkinThickness": "skin",
+        "Insulin": "test",
+        "BMI": "mass",
+        "DiabetesPedigreeFunction": "pedi",
+        "Age": "age",
+        "Outcome": "class",
+    }
 
     df = df.copy()
+    if all(col in df.columns for col in full_to_short):
+        df = df.rename(columns=full_to_short)
+
+    missing_cols = [col for col in feature_cols + ["class"] if col not in df.columns]
+    if missing_cols:
+        raise ValueError(f"Missing required columns after normalization: {missing_cols}")
+
     df[zero_cols] = df[zero_cols].replace(0, np.nan)
     df.fillna(df.mean(numeric_only=True), inplace=True)
 
@@ -35,18 +54,24 @@ def build_features(df: pd.DataFrame):
     rfe = RFE(RandomForestClassifier(100, random_state=SEED), n_features_to_select=4, step=1)
     rfe.fit(x_base, y)
     rfe_names = [feature_cols[i] for i in range(len(feature_cols)) if rfe.support_[i]]
+    rfe_indices = [i for i in range(len(feature_cols)) if rfe.support_[i]]
     print(f"RFE features: {rfe_names}")
+
+    # Build exactly 4 interaction terms from the currently selected RFE features.
+    pair_candidates = list(combinations(rfe_indices, 2))
+    chosen_pairs = pair_candidates[:4]
+    inter_arrays = [x_base[:, i] * x_base[:, j] for i, j in chosen_pairs]
+    inter_names = [f"{feature_cols[i]}_x_{feature_cols[j]}" for i, j in chosen_pairs]
 
     x_inter = np.column_stack([
         x_base,
-        x_base[:, 1] * x_base[:, 5],
-        x_base[:, 1] * x_base[:, 7],
-        x_base[:, 5] * x_base[:, 6],
-        x_base[:, 1] * x_base[:, 6],
+        *inter_arrays,
     ])
 
-    print(f"Using {x_inter.shape[1]} features (8 original + 4 interactions)")
-    return x_inter, y
+    feature_names = feature_cols + inter_names
+    print(f"Interaction features from RFE set: {inter_names}")
+    print(f"Using {x_inter.shape[1]} features (8 original + 4 RFE-based interactions)")
+    return x_inter, y, feature_names
 
 
 def best_threshold(y_true, y_prob):
@@ -293,8 +318,8 @@ def main():
     parser.add_argument("--with-shap", action="store_true", help="Generate SHAP plots for screenshots")
     args = parser.parse_args()
 
-    df = pd.read_csv("diabetes.csv")
-    x, y = build_features(df)
+    df = pd.read_csv("pima-indians-diabetes.csv")
+    x, y, feature_names = build_features(df)
 
     # Preserving your current strategy (SMOTE before split) for comparability and high score search.
     x_sm, y_sm = SMOTE(random_state=SEED, k_neighbors=5).fit_resample(x, y)
@@ -345,20 +370,6 @@ def main():
     print("=" * 58)
 
     if args.with_shap:
-        feature_names = [
-            "preg",
-            "plas",
-            "pres",
-            "skin",
-            "test",
-            "mass",
-            "pedi",
-            "age",
-            "plas_x_mass",
-            "plas_x_age",
-            "mass_x_pedi",
-            "plas_x_pedi",
-        ]
         generate_shap_plots(
             x_train=best["Xtr"],
             y_train=best["ytr"],
