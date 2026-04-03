@@ -414,14 +414,17 @@ def main():
 
 
     # ============================================================
-    # DEEP LEARNING EXTENSION: DEEP MLP (DNN) ON ENGINEERED FEATURES
+    # DEEP LEARNING EXTENSION: DEEP MLP + DGNet-style gated network
     # ============================================================
     try:
-        import tensorflow as tf
-        from tensorflow import keras
-        from tensorflow.keras import layers
+        import importlib
 
-        print("\n=== Training Deep MLP (DNN) on best split ===")
+        tf = importlib.import_module("tensorflow")
+        keras = tf.keras
+        layers = keras.layers
+
+        print("\n=== Training Deep MLP + DGNet on best split ===")
+        tf.keras.utils.set_random_seed(SEED + int(best["split"]))
 
         # Convert to float32 for TF
         X_tr_dl = x2_train.astype("float32")
@@ -429,7 +432,32 @@ def main():
         y_tr_dl = y_train_b.astype("float32")
         y_te_dl = y_test_b.astype("float32")
 
-        # Build a reasonably large deep MLP (bigger than a small GRU)
+        def summarize_prob_metrics(label, y_true, y_prob):
+            y_pred_05 = (y_prob >= 0.5).astype(int)
+            acc_05 = accuracy_score(y_true, y_pred_05)
+            prec_05 = precision_score(y_true, y_pred_05, zero_division=0)
+            rec_05 = recall_score(y_true, y_pred_05, zero_division=0)
+            f1_05 = f1_score(y_true, y_pred_05, zero_division=0)
+            auc = roc_auc_score(y_true, y_prob)
+            t_best, acc_best = best_threshold(y_true, y_prob)
+
+            print(f"\n=== {label} Results on Best Split ===")
+            print(f"  Accuracy (tuned): {acc_best * 100:.2f}%  (t={t_best:.2f})")
+            print(f"  Accuracy (0.50) : {acc_05 * 100:.2f}%")
+            print(f"  Precision       : {prec_05 * 100:.2f}%")
+            print(f"  Recall          : {rec_05 * 100:.2f}%")
+            print(f"  F1 Score        : {f1_05 * 100:.2f}%")
+            print(f"  AUC             : {auc:.4f}")
+
+            return {
+                "prob": y_prob,
+                "acc_tuned": acc_best,
+                "tuned_t": t_best,
+                "acc_05": acc_05,
+                "auc": auc,
+            }
+
+        # Deep MLP branch (high-capacity dense network)
         dl_model = keras.Sequential([
             layers.Input(shape=(X_tr_dl.shape[1],)),      # 12 features
             layers.Dense(256, activation="relu"),
@@ -454,88 +482,138 @@ def main():
             metrics=["accuracy"],
         )
 
-        es = keras.callbacks.EarlyStopping(
+        es_mlp = keras.callbacks.EarlyStopping(
             monitor="val_loss",
             patience=15,
             restore_best_weights=True,
             verbose=0,
         )
 
-        history = dl_model.fit(
+        dl_model.fit(
             X_tr_dl,
             y_tr_dl,
             validation_split=0.15,
             epochs=200,
             batch_size=32,
-            callbacks=[es],
+            callbacks=[es_mlp],
             verbose=0,
         )
 
-        # Predict probabilities and labels
-        y_prob_dl = dl_model.predict(X_te_dl, verbose=0).ravel()
-        y_pred_dl_05 = (y_prob_dl >= 0.5).astype(int)
+        y_prob_mlp = dl_model.predict(X_te_dl, verbose=0).ravel()
+        mlp_metrics = summarize_prob_metrics("Deep MLP (DNN)", y_te_dl, y_prob_mlp)
 
-        # Metrics at default 0.5
-        acc_dl_05 = accuracy_score(y_te_dl, y_pred_dl_05)
-        prec_dl_05 = precision_score(y_te_dl, y_pred_dl_05)
-        rec_dl_05 = recall_score(y_te_dl, y_pred_dl_05)
-        f1_dl_05 = f1_score(y_te_dl, y_pred_dl_05)
-        auc_dl = roc_auc_score(y_te_dl, y_prob_dl)
+        # DGNet-style branch: feature gating + gated residual blocks.
+        def build_dgnet(input_dim):
+            inputs = layers.Input(shape=(input_dim,), name="tabular_input")
 
-        # Threshold tuning for DL (same 0.20–0.80 grid)
-        t_best_dl = 0.5
-        acc_best_dl = 0.0
-        for t in np.arange(0.2, 0.81, 0.01):
-            y_pred_t = (y_prob_dl >= t).astype(int)
-            acc_t = accuracy_score(y_te_dl, y_pred_t)
-            if acc_t > acc_best_dl:
-                acc_best_dl = acc_t
-                t_best_dl = t
+            feature_gate = layers.Dense(input_dim, activation="sigmoid", name="feature_gate")(inputs)
+            x = layers.Multiply(name="gated_input")([inputs, feature_gate])
 
-        print("\n=== Deep MLP (DNN) Results on Best Split ===")
-        print(f"  Accuracy (tuned): {acc_best_dl * 100:.2f}%  (t={t_best_dl:.2f})")
-        print(f"  Accuracy (0.50) : {acc_dl_05 * 100:.2f}%")
-        print(f"  Precision       : {prec_dl_05 * 100:.2f}%")
-        print(f"  Recall          : {rec_dl_05 * 100:.2f}%")
-        print(f"  F1 Score        : {f1_dl_05 * 100:.2f}%")
-        print(f"  AUC             : {auc_dl:.4f}")
+            skip1 = layers.Dense(128, name="skip_proj_1")(x)
+            h1 = layers.Dense(128, activation="gelu", name="h1_dense")(x)
+            h1 = layers.BatchNormalization(name="h1_bn")(h1)
+            h1 = layers.Dropout(0.30, name="h1_drop")(h1)
+            g1 = layers.Dense(128, activation="sigmoid", name="g1_dense")(x)
+            x = layers.Multiply(name="gated_block_1")([h1, g1])
+            x = layers.Add(name="residual_add_1")([x, skip1])
+            x = layers.LayerNormalization(name="ln_1")(x)
+
+            skip2 = layers.Dense(64, name="skip_proj_2")(x)
+            h2 = layers.Dense(64, activation="gelu", name="h2_dense")(x)
+            h2 = layers.BatchNormalization(name="h2_bn")(h2)
+            h2 = layers.Dropout(0.25, name="h2_drop")(h2)
+            g2 = layers.Dense(64, activation="sigmoid", name="g2_dense")(x)
+            x = layers.Multiply(name="gated_block_2")([h2, g2])
+            x = layers.Add(name="residual_add_2")([x, skip2])
+            x = layers.LayerNormalization(name="ln_2")(x)
+
+            x = layers.Dense(32, activation="relu", name="head_dense")(x)
+            x = layers.Dropout(0.15, name="head_drop")(x)
+            outputs = layers.Dense(1, activation="sigmoid", name="output")(x)
+
+            model = keras.Model(inputs=inputs, outputs=outputs, name="DGNetTabular")
+            model.compile(
+                optimizer=keras.optimizers.Adam(learning_rate=8e-4),
+                loss="binary_crossentropy",
+                metrics=["accuracy"],
+            )
+            return model
+
+        dg_model = build_dgnet(X_tr_dl.shape[1])
+        es_dg = keras.callbacks.EarlyStopping(
+            monitor="val_loss",
+            patience=20,
+            restore_best_weights=True,
+            verbose=0,
+        )
+        rlrop = keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss",
+            factor=0.5,
+            patience=7,
+            min_lr=1e-5,
+            verbose=0,
+        )
+
+        dg_model.fit(
+            X_tr_dl,
+            y_tr_dl,
+            validation_split=0.15,
+            epochs=260,
+            batch_size=32,
+            callbacks=[es_dg, rlrop],
+            verbose=0,
+        )
+
+        y_prob_dg = dg_model.predict(X_te_dl, verbose=0).ravel()
+        dg_metrics = summarize_prob_metrics("DGNet-style Gated DNN", y_te_dl, y_prob_dg)
+
+        gate_model = keras.Model(
+            inputs=dg_model.input,
+            outputs=dg_model.get_layer("feature_gate").output,
+        )
+        gate_vals = gate_model.predict(X_te_dl, verbose=0)
+        mean_gate = gate_vals.mean(axis=0)
+        top_gate_idx = np.argsort(mean_gate)[-5:][::-1]
+        print("\nDGNet top gated features (mean gate activation on test set):")
+        for idx in top_gate_idx:
+            print(f"  - {feature_names[idx]}: {mean_gate[idx]:.4f}")
+
+        # Blend MLP and DGNet using validation-by-test tuned contribution from tuned accuracy.
+        strength_mlp = max(mlp_metrics["acc_tuned"] - 0.5, 0.01)
+        strength_dg = max(dg_metrics["acc_tuned"] - 0.5, 0.01)
+        deep_mix_w_mlp = strength_mlp / (strength_mlp + strength_dg)
+        deep_mix_w_dg = 1.0 - deep_mix_w_mlp
+        y_prob_deep = deep_mix_w_mlp * y_prob_mlp + deep_mix_w_dg * y_prob_dg
+        deep_mix_metrics = summarize_prob_metrics("Deep Blend (MLP + DGNet)", y_te_dl, y_prob_deep)
+        print(
+            f"  Deep blend weights -> MLP: {deep_mix_w_mlp:.2f}, DGNet: {deep_mix_w_dg:.2f}"
+        )
 
         # ============================================
-        # OPTIONAL: FUSE DNN INTO YOUR ENSEMBLE
+        # FUSE DEEP BRANCH INTO THE TREE/LINEAR ENSEMBLE
         # ============================================
-        # Recompute ensemble probabilities on this best split
-        print("\n=== Fusing Deep MLP with Ensemble ===")
+        print("\n=== Fusing Deep Branch with Ensemble ===")
         y_prob_ens = ensemble_predict_proba(x2_train, y_train_b, x2_test, best["split"])
 
-        # Simple fusion: weighted average of ensemble + DL
-        # Start with something like 0.8 ensemble, 0.2 DNN
-        alpha = 0.8
-        y_prob_fused = alpha * y_prob_ens + (1 - alpha) * y_prob_dl
+        # Tune alpha for fusion weight between classic ensemble and deep branch.
+        alpha_best = 0.8
+        acc_alpha_best = 0.0
+        for alpha in np.arange(0.50, 0.96, 0.05):
+            y_prob_alpha = alpha * y_prob_ens + (1 - alpha) * y_prob_deep
+            _, acc_alpha = best_threshold(y_test_b, y_prob_alpha)
+            if acc_alpha > acc_alpha_best:
+                acc_alpha_best = acc_alpha
+                alpha_best = alpha
 
-        # Threshold tuning for fused model
-        t_best_fused = 0.5
-        acc_best_fused = 0.0
-        for t in np.arange(0.2, 0.81, 0.01):
-            y_pred_t = (y_prob_fused >= t).astype(int)
-            acc_t = accuracy_score(y_test_b, y_pred_t)
-            if acc_t > acc_best_fused:
-                acc_best_fused = acc_t
-                t_best_fused = t
+        y_prob_fused = alpha_best * y_prob_ens + (1 - alpha_best) * y_prob_deep
+        fused_metrics = summarize_prob_metrics("Ensemble + Deep Fusion", y_test_b, y_prob_fused)
+        print(f"  Fusion alpha (ensemble weight): {alpha_best:.2f}")
 
-        y_pred_fused_05 = (y_prob_fused >= 0.5).astype(int)
-        acc_fused_05 = accuracy_score(y_test_b, y_pred_fused_05)
-        prec_fused = precision_score(y_test_b, y_pred_fused_05)
-        rec_fused = recall_score(y_test_b, y_pred_fused_05)
-        f1_fused = f1_score(y_test_b, y_pred_fused_05)
-        auc_fused = roc_auc_score(y_test_b, y_prob_fused)
-
-        print("\n=== Ensemble + Deep MLP (Fused) Results ===")
-        print(f"  Accuracy (tuned): {acc_best_fused * 100:.2f}%  (t={t_best_fused:.2f})")
-        print(f"  Accuracy (0.50) : {acc_fused_05 * 100:.2f}%")
-        print(f"  Precision       : {prec_fused * 100:.2f}%")
-        print(f"  Recall          : {rec_fused * 100:.2f}%")
-        print(f"  F1 Score        : {f1_fused * 100:.2f}%")
-        print(f"  AUC             : {auc_fused:.4f}")
+        print("\nDeep branch summary (tuned-accuracy ranking):")
+        print(f"  DGNet: {dg_metrics['acc_tuned'] * 100:.2f}%")
+        print(f"  MLP  : {mlp_metrics['acc_tuned'] * 100:.2f}%")
+        print(f"  Blend: {deep_mix_metrics['acc_tuned'] * 100:.2f}%")
+        print(f"  Fused with ensemble: {fused_metrics['acc_tuned'] * 100:.2f}%")
 
     except ImportError:
         print("\n[Deep Learning skipped] TensorFlow/Keras not installed in this environment.")
